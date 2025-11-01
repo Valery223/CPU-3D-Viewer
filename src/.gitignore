@@ -1,0 +1,13 @@
+.qmake.stash
+*.o *.a
+.vscode/*
+moc_*
+main
+.clang-format
+*.txt
+*.py
+main2_interpolate
+main3_interpolate
+test
+build/*
+build
