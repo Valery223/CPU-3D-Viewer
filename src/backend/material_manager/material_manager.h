@@ -39,6 +39,11 @@ struct Material {
 class MaterialManager {
  public:
   /**
+   * @brief Кладёт дефолтный материал на индекс 0 — для мешей без usemtl.
+   */
+  MaterialManager();
+
+  /**
    * @brief Загружает материал из файла.
    * @param filePath Путь к файлу материала.
    * @return Идентификатор загруженного материала.

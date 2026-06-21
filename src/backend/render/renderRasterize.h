@@ -1,6 +1,7 @@
 #ifndef RENDER_RASTERIZE
 #define RENDER_RASTERIZE
 
+#include <chrono>
 #include <mutex>
 #include <vector>
 
@@ -28,6 +29,16 @@ class RenderRasterize : public IRender {
   void rendering(Scene& scene) override;
 
  private:
+  // Копит время кадров и раз в секунду пишет в stderr кадров/с и время кадра.
+  void accountFrame(double frameMs);
+
+  std::chrono::steady_clock::time_point fpsWindowStart_{};
+  bool fpsInited_ = false;
+  int fpsFrameCount_ = 0;
+  double fpsMsAccum_ = 0.0;
+  double fpsMsMin_ = 0.0;
+  double fpsMsMax_ = 0.0;
+
   /**
    * @brief Преобразует объект в мировые координаты.
    */
@@ -90,7 +101,8 @@ class RenderRasterize : public IRender {
                     const UVCoordinate texture_coord_2, const Normal normal0,
                     const Normal normal1, const Normal normal3,
                     const Vertex& vg1, const Vertex& vg2, const Vertex& vg3,
-                    const Light& light, const Material& material);
+                    const Light& light, const Material& material, int yLo,
+                    int yHi, unsigned char* bits, qsizetype bpl, int W, int H);
 
   /**
    * @brief Вычисляет освещение по модели Фонга для вершины.

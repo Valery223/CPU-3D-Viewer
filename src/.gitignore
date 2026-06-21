@@ -11,3 +11,6 @@ main3_interpolate
 test
 build/*
 build
+
+# скачанные модели держим вне репозитория (модели .obj и так в *.obj выше)
+objects_files/BAC_Batman70s_rocksteady/

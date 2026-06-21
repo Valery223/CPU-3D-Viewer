@@ -50,12 +50,34 @@ class ObjectLoader {
   static UVCoordinate parseUVcoordiantes(std::istringstream& iss);
 
   /**
-   * @brief Разбирает грань из потока.
-   * @param iss Поток входных данных.
-   * @param materialIndex Индекс материала для данной грани.
-   * @return Разобранная грань.
+   * @struct FaceVertex
+   * @brief Один угол грани: 0-based индексы вершины/UV/нормали.
+   *        Значение -1 означает, что компонента отсутствует в файле.
    */
-  static Face parseFace(std::istringstream& iss, uint32_t materialIndex);
+  struct FaceVertex {
+    int v;
+    int vt;
+    int vn;
+  };
+
+  /**
+   * @brief Разбирает один токен грани (v, v/vt, v//vn, v/vt/vn).
+   *        Поддерживает относительные (отрицательные) индексы OBJ.
+   * @param token Токен угла грани.
+   * @param mesh Меш (нужен для разрешения относительных индексов).
+   * @return Разобранный угол с 0-based индексами.
+   */
+  static FaceVertex parseFaceVertex(const std::string& token, const Mesh& mesh);
+
+  /**
+   * @brief Триангулирует полигон веером и добавляет грани в меш,
+   *        генерируя нормали и UV там, где их нет в файле.
+   * @param mesh Меш, в который добавляются грани.
+   * @param poly Углы полигона (>= 3).
+   * @param materialIndex Индекс материала.
+   */
+  static void addPolygon(Mesh& mesh, const std::vector<FaceVertex>& poly,
+                         uint32_t materialIndex);
 };
 }  // namespace s21
 #endif  // OBJECT_LOADER_H

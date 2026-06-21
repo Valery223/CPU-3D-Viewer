@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <iostream>
 
+#include "backend/loaders/pathUtil.h"
 #include "backend/loaders/textureLoader/TextureLoader.h"
 
 namespace s21 {
@@ -45,14 +46,10 @@ void MtlFileLoader::loadMtl(const std::string& filepath,
       std::filesystem::path mtlPath(filepath);
       std::filesystem::path dirPath = mtlPath.parent_path();
 
-      std::filesystem::path textureKdPath = dirPath / textureKdName;
+      std::string textureKdPath = resolveAssetPath(dirPath, textureKdName);
 
-      try {
-        Texture texture = TextureLoader::loadTexture(textureKdPath);
-        material.texture = texture;
-      } catch (const std::invalid_argument& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-      }
+      Texture texture = TextureLoader::loadTexture(textureKdPath);
+      material.texture = texture;
     }
   }
 

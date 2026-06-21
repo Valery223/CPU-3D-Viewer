@@ -3,47 +3,85 @@
 #include <omp.h>
 #include <qdebug.h>
 
+#include <cstdio>
+
 namespace s21 {
 RenderRasterize::RenderRasterize(RenderSettings& settings, int width, int hight)
     : IRender(settings, width, hight) {}
 
 void RenderRasterize::rendering(Scene& scene) {
+  auto frameStart = std::chrono::steady_clock::now();
+
   QMutexLocker locker(&_backBufferMutex);
   clearImage();
 
   for (int i = 0; i < scene.getObjects().size(); i++) {
-    const Object& localObj = scene.getObjects()[i];
-    Object globalObj = scene.getObjects()[i];
+    // Трансформируем один рабочий меш in-place. Мировые вершины держим отдельно:
+    // они ещё нужны для освещения, а work к тому моменту уже в clip space.
+    Object work = scene.getObjects()[i];
 
-    transformToWorldCoordinates(localObj, globalObj);
+    transformToWorldCoordinates(work, work);
+
+    std::vector<Vertex> worldVertex = work.getMesh().vertices_;
 
     Camera& camera = *scene.getCurrentCamera();
     Vector3F viewDir = camera.target - camera.position;
-    globalObj.getMesh().faces_ = performBackfaceCullingParallel(
-        globalObj.getMesh().faces_, globalObj.getMesh().vertices_, viewDir);
+    work.getMesh().faces_ = performBackfaceCullingParallel(
+        work.getMesh().faces_, work.getMesh().vertices_, viewDir);
 
-    Object cameraObj = globalObj;
-    transformToCameraCoordinates(camera, globalObj, cameraObj);
+    transformToCameraCoordinates(camera, work, work);  // world -> camera
+    projectToCamera(camera, work, work);               // camera -> clip space
+    clipedObject(camera, work);                        // отсечение граней
 
-    Object projectObj = cameraObj;
-    projectToCamera(camera, cameraObj, projectObj);
-
-    clipedObject(camera, projectObj);
-
-    std::vector<Vertex> screenVertex(projectObj.getMesh().vertices_.size());
-    projectToScreen(projectObj, screenVertex);
+    std::vector<Vertex> screenVertex(work.getMesh().vertices_.size());
+    projectToScreen(work, screenVertex);
 
     if (m_settings.renderFace) {
-      rasterizeMesh(projectObj.getMesh(), screenVertex,
-                    globalObj.getMesh().vertices_, scene);
+      rasterizeMesh(work.getMesh(), screenVertex, worldVertex, scene);
     }
     if (m_settings.renderDot || m_settings.renderLine) {
-      rasterizeMesh2(projectObj.getMesh(), screenVertex, scene);
+      rasterizeMesh2(work.getMesh(), screenVertex, scene);
     }
   }
 
   QMutexLocker frontLocker(&_frontBufferMutex);
   swapBuffers();
+
+  auto frameEnd = std::chrono::steady_clock::now();
+  accountFrame(
+      std::chrono::duration<double, std::milli>(frameEnd - frameStart).count());
+}
+
+void RenderRasterize::accountFrame(double frameMs) {
+  auto now = std::chrono::steady_clock::now();
+  if (!fpsInited_) {
+    fpsWindowStart_ = now;
+    fpsInited_ = true;
+    fpsMsMin_ = fpsMsMax_ = frameMs;
+  }
+
+  fpsFrameCount_++;
+  fpsMsAccum_ += frameMs;
+  fpsMsMin_ = std::min(fpsMsMin_, frameMs);
+  fpsMsMax_ = std::max(fpsMsMax_, frameMs);
+
+  double windowMs =
+      std::chrono::duration<double, std::milli>(now - fpsWindowStart_).count();
+  if (windowMs >= 1000.0) {
+    double avgMs = fpsMsAccum_ / fpsFrameCount_;
+    // realFps упирается в кэп таймера (~60), потолок 1000/avg от кэпа не зависит.
+    double realFps = fpsFrameCount_ * 1000.0 / windowMs;
+    std::fprintf(stderr,
+                 "[render] %.1f fps | frame avg %.2f ms (min %.2f, max %.2f) | "
+                 "потолок ~%.0f fps\n",
+                 realFps, avgMs, fpsMsMin_, fpsMsMax_,
+                 avgMs > 0.0 ? 1000.0 / avgMs : 0.0);
+
+    fpsWindowStart_ = now;
+    fpsFrameCount_ = 0;
+    fpsMsAccum_ = 0.0;
+    fpsMsMin_ = fpsMsMax_ = frameMs;
+  }
 }
 
 void RenderRasterize::transformToWorldCoordinates(const Object& objInput,
@@ -267,30 +305,47 @@ void RenderRasterize::rasterizeMesh(const Mesh& mesh,
                                     std::vector<Vertex>& screenVertex,
                                     const std::vector<Vertex>& globalVertex,
                                     const Scene& scene) {
-  for (int i = 0; i < mesh.faces_.size(); i++) {
-    Face face = mesh.faces_[i];
-    const Vertex& v0 = screenVertex[face.vertexIndex[0]];
-    const Vertex& v1 = screenVertex[face.vertexIndex[1]];
-    const Vertex& v2 = screenVertex[face.vertexIndex[2]];
+  const int W = _backBuffer.width();
+  const int H = _backBuffer.height();
+  // Один detach в начале — дальше потоки пишут в сырые байты напрямую.
+  unsigned char* bits = _backBuffer.bits();
+  const qsizetype bpl = _backBuffer.bytesPerLine();
+  const Light& light = scene.getLight(0);
 
-    const UVCoordinate texture_coord_0 =
-        mesh.uvCoordinates_[face.uvCoordinateIndex[0]];
-    const UVCoordinate texture_coord_1 =
-        mesh.uvCoordinates_[face.uvCoordinateIndex[1]];
-    const UVCoordinate texture_coord_2 =
-        mesh.uvCoordinates_[face.uvCoordinateIndex[2]];
+  // Делим экран на горизонтальные полосы строк и раздаём потокам. Полоса владеет
+  // своими строками, так что записи в цвет/глубину не пересекаются и блокировки
+  // не нужны. Полос берём больше, чем потоков: треугольники по кадру распределены
+  // неравномерно, и schedule(dynamic) сам выравнивает нагрузку.
+  const int bands = std::min(H, std::max(1, omp_get_max_threads() * 4));
 
-    const Normal normal0 = mesh.normals_[face.normalIndex[0]];
-    const Normal normal1 = mesh.normals_[face.normalIndex[1]];
-    const Normal normal2 = mesh.normals_[face.normalIndex[2]];
+#pragma omp parallel for schedule(dynamic)
+  for (int b = 0; b < bands; ++b) {
+    const int yLo = static_cast<int>(static_cast<long long>(b) * H / bands);
+    const int yHi = static_cast<int>(static_cast<long long>(b + 1) * H / bands);
 
-    const Vertex vg0 = globalVertex[face.vertexIndex[0]];
-    const Vertex vg1 = globalVertex[face.vertexIndex[1]];
-    const Vertex vg2 = globalVertex[face.vertexIndex[2]];
+    for (size_t i = 0; i < mesh.faces_.size(); ++i) {
+      const Face& face = mesh.faces_[i];
+      const Vertex& v0 = screenVertex[face.vertexIndex[0]];
+      const Vertex& v1 = screenVertex[face.vertexIndex[1]];
+      const Vertex& v2 = screenVertex[face.vertexIndex[2]];
 
-    drawTriangle(v0, v1, v2, texture_coord_0, texture_coord_1, texture_coord_2,
-                 normal0, normal1, normal2, vg0, vg1, vg2, scene.getLight(0),
-                 scene.getMaterial(mesh.faces_[i].materialIndex));
+      // Быстрый отбор: треугольник не задевает строки этой полосы.
+      int triMinY = static_cast<int>(std::min({v0.y(), v1.y(), v2.y()}));
+      int triMaxY = static_cast<int>(std::max({v0.y(), v1.y(), v2.y()}));
+      if (triMaxY < yLo || triMinY >= yHi) continue;
+
+      drawTriangle(v0, v1, v2, mesh.uvCoordinates_[face.uvCoordinateIndex[0]],
+                   mesh.uvCoordinates_[face.uvCoordinateIndex[1]],
+                   mesh.uvCoordinates_[face.uvCoordinateIndex[2]],
+                   mesh.normals_[face.normalIndex[0]],
+                   mesh.normals_[face.normalIndex[1]],
+                   mesh.normals_[face.normalIndex[2]],
+                   globalVertex[face.vertexIndex[0]],
+                   globalVertex[face.vertexIndex[1]],
+                   globalVertex[face.vertexIndex[2]], light,
+                   scene.getMaterial(face.materialIndex), yLo, yHi, bits, bpl, W,
+                   H);
+    }
   }
 }
 
@@ -300,94 +355,72 @@ void RenderRasterize::drawTriangle(
     const UVCoordinate texture_coord_2, const Normal normal0,
     const Normal normal1, const Normal normal3, const Vertex& vg1,
     const Vertex& vg2, const Vertex& vg3, const Light& light,
-    const Material& material) {
+    const Material& material, int yLo, int yHi, unsigned char* bits,
+    qsizetype bpl, int W, int H) {
   Eigen::Vector2i p0(v0.x(), v0.y());
   Eigen::Vector2i p1(v1.x(), v1.y());
   Eigen::Vector2i p2(v2.x(), v2.y());
 
   int minX = std::max(0, std::min({p0.x(), p1.x(), p2.x()}));
-  int maxX =
-      std::min(_backBuffer.width() - 1, std::max({p0.x(), p1.x(), p2.x()}));
-  int minY = std::max(0, std::min({p0.y(), p1.y(), p2.y()}));
-  int maxY =
-      std::min(_backBuffer.height() - 1, std::max({p0.y(), p1.y(), p2.y()}));
+  int maxX = std::min(W - 1, std::max({p0.x(), p1.x(), p2.x()}));
+  // Y зажимаем и буфером, и границами текущей полосы [yLo, yHi).
+  int minY = std::max(yLo, std::min({p0.y(), p1.y(), p2.y()}));
+  int maxY = std::min(yHi - 1, std::max({p0.y(), p1.y(), p2.y()}));
+  if (minX > maxX || minY > maxY) return;
 
   float area = triangleArea(p0, p1, p2);
+  if (area <= 0.0f) return;  // вырожденный треугольник
 
-  std::vector<std::vector<float>> localDepthBuffer;
-  localDepthBuffer = std::vector<std::vector<float>>(
-      maxX - minX + 1, std::vector<float>(maxY - minY + 1, 1.0f));
+  const bool useTexture =
+      m_settings.texture && !material.texture.colors_.empty();
 
-  QImage localImage =
-      _backBuffer.copy(minX, minY, maxX - minX + 1, maxY - minY + 1);
-
-#pragma omp parallel for
   for (int x = minX; x <= maxX; ++x) {
+    std::vector<float>& depthCol = depthBuffer[x];  // непрерывно по y
     for (int y = minY; y <= maxY; ++y) {
       Eigen::Vector2i p(x, y);
       Eigen::Vector3f baryCoords = barycentricCoords(p, p0, p1, p2, area);
+      if (baryCoords[0] < 0 || baryCoords[1] < 0 || baryCoords[2] < 0 ||
+          std::abs(baryCoords.sum() - 1.0f) >= 1e-6f)
+        continue;
 
-      if (baryCoords[0] >= 0 && baryCoords[1] >= 0 && baryCoords[2] >= 0 &&
-          std::abs(baryCoords.sum() - 1) < 1e-6) {
-        float depth = interpolate(v0.z(), v1.z(), v2.z(), baryCoords);
-        // float depth = 0;
+      float depth = interpolate(v0.z(), v1.z(), v2.z(), baryCoords);
+      if (depth >= depthCol[y]) continue;
+      depthCol[y] = depth;
 
-        if (depth < localDepthBuffer[x - minX][y - minY]) {
-          localDepthBuffer[x - minX][y - minY] = depth;
+      Normal interpolateNormal =
+          interpolate(normal0, normal1, normal3, baryCoords);
+      Vertex interpolateGlobalVertex = interpolate(vg1, vg2, vg3, baryCoords);
+      Color lightColor = calculatePhongIlluminationForVertex(
+          interpolateGlobalVertex, interpolateNormal, material, light,
+          Vector3F{0.0f, 0.0f, 150.0f});
 
-          Normal interpolateNormal =
-              interpolate(normal0, normal1, normal3, baryCoords);
-
-          Vertex interpolateGlobalVertex =
-              interpolate(vg1, vg2, vg3, baryCoords);
-          Color lightColor = calculatePhongIlluminationForVertex(
-              interpolateGlobalVertex, interpolateNormal, material, light,
-              Vector3F{0.0f, 0.0f, 150.0f});
-          Color finalColor{0, 0, 0};
-          if (m_settings.texture) {
-            UVCoordinate w0 = texture_coord_0 / v0.w();
-            UVCoordinate w1 = texture_coord_1 / v1.w();
-            UVCoordinate w2 = texture_coord_2 / v2.w();
-            UVCoordinate interpolatedTextureCoordinate =
-                interpolate(w0, w1, w2, baryCoords);
-            interpolatedTextureCoordinate *=
-                (1.0f / interpolate(1.0f / v0.w(), 1.0f / v1.w(), 1.0f / v2.w(),
-                                    baryCoords));
-
-            int x1 = static_cast<int>(interpolatedTextureCoordinate.x() *
-                                      (material.texture.width_ - 1));
-            int y1 = static_cast<int>(interpolatedTextureCoordinate.y() *
-                                      (material.texture.height_ - 1));
-
-            int index = y1 * material.texture.width_ + x1;
-            Eigen::Vector3f texture_color = material.texture.colors_[index];
-            finalColor = texture_color;
-
-            finalColor =
-                (lightColor / 255).cwiseProduct(finalColor / 255) * 255;
-          } else {
-            finalColor = lightColor;
-          }
-          QColor color(std::clamp(int(finalColor[0]), 0, 255),
-                       std::clamp(int(finalColor[1]), 0, 255),
-                       std::clamp(int(finalColor[2]), 0, 255));
-
-          localImage.setPixelColor(x - minX, y - minY, color);
-        }
+      Color finalColor = lightColor;
+      if (useTexture) {
+        UVCoordinate w0 = texture_coord_0 / v0.w();
+        UVCoordinate w1 = texture_coord_1 / v1.w();
+        UVCoordinate w2 = texture_coord_2 / v2.w();
+        UVCoordinate uv = interpolate(w0, w1, w2, baryCoords);
+        uv *= (1.0f / interpolate(1.0f / v0.w(), 1.0f / v1.w(), 1.0f / v2.w(),
+                                  baryCoords));
+        int x1 = std::clamp(
+            static_cast<int>(uv.x() * (material.texture.width_ - 1)), 0,
+            material.texture.width_ - 1);
+        int y1 = std::clamp(
+            static_cast<int>(uv.y() * (material.texture.height_ - 1)), 0,
+            material.texture.height_ - 1);
+        const Color& texture_color =
+            material.texture.colors_[y1 * material.texture.width_ + x1];
+        finalColor = (lightColor / 255).cwiseProduct(texture_color / 255) * 255;
       }
-    }
-  }
 
-#pragma omp critical
-  {
-    for (int x = minX; x <= maxX; ++x) {
-      for (int y = minY; y <= maxY; ++y) {
-        if (localDepthBuffer[x - minX][y - minY] < depthBuffer[x][y]) {
-          depthBuffer[x][y] = localDepthBuffer[x - minX][y - minY];
-          _backBuffer.setPixelColor(x, y,
-                                    localImage.pixelColor(x - minX, y - minY));
-        }
-      }
+      quint32* px = reinterpret_cast<quint32*>(bits + static_cast<qsizetype>(y) *
+                                                          bpl);
+      px[x] = 0xFF000000u |
+              (static_cast<quint32>(std::clamp(int(finalColor[0]), 0, 255))
+               << 16) |
+              (static_cast<quint32>(std::clamp(int(finalColor[1]), 0, 255))
+               << 8) |
+              static_cast<quint32>(std::clamp(int(finalColor[2]), 0, 255));
     }
   }
 }

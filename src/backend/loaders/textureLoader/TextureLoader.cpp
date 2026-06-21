@@ -22,8 +22,12 @@ std::vector<Color> TextureLoader::loadImageToEigenArray(
       stbi_load(filename.c_str(), &width, &height, &channels, 3);
 
   if (!imageData) {
-    std::cerr << "Error: Failed to load image: " << filename << std::endl;
-    exit(1);
+    // Раньше тут был exit(1). Возвращаем пустую текстуру: меш отрисуется
+    // заливкой, а не уронит всё приложение из-за одной битой картинки.
+    std::cerr << "Warning: Failed to load image: " << filename
+              << " (рендерится без текстуры)" << std::endl;
+    width = 0;
+    height = 0;
     return {};
   }
 
